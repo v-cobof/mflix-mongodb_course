@@ -1,0 +1,221 @@
+- instalar o driver pelo nuget
+
+var client = new MongoClient("URI")
+
+var db = client.GetDatabase("db_name")
+
+// aqui usa o BsonDocument para mapear a collection, mas isso não é bom.
+// o certo é fazer um model para a collection, e colocar ela ali, para mapear
+// o retorno em um objeto bem definido
+var collection = db.GetCollection<BsonDocument>("collection_name")
+
+var result = collection.Find()
+
+---------------------------------------------------------------------------------
+
+Podemo ler dados do BD de 4 formas diferentes
+
+1) query do mongo como string
+var result = db.collection.Find("{ price: { $gt: 200 } }")
+
+2) usar o BsonDocument (zuado)
+// cada chave é um novo BsonDocument
+var result = db.collection.Find( new BsonDocument("price", new BsonDocument("$gt", 200)) )
+
+3) usar o Builder
+var builder = Builders<BsonDocument>.Filter;
+var filter = builder.Gt("price", 400) & builder.Lt("price", 600);
+var result = db.collection.Find(filter);
+
+4) usar mapping class e linq (melhor de todos)
+as propriedades podem ser em pascal case, mas devem ter o mesmo nome q as propriedades no mongo
+se vc quiser um nome diferente coloca em cima da propriedade [BsonElement("nome_no_banco")]
+o Id deve ter em cima dele [BsonId]
+no exemplo a classe é Guitar
+var guitars = db.GetCollection<Guitar>("guitars");
+var expensiveGuitars = guitars.Find(t => t.Price > 400).ToList();
+
+
+---- posso fazer consultas assincronas tbm ----
+
+
+
+---inserção---
+
+insertOne e insertMany (passa uma lista)
+- o mongo gera um Id no mesmo objeto depois de vc inserir ele
+
+---update---
+
+colection.UpdateOne( filter, Builders<Model>.Update.Set(t => t.location.Address.Street, "Rua") )
+
+
+
+---- write concern ----
+
+ao hospedar o mongo no Atlas, temos um cluster
+que é um replicaset de nodes. Cada node é uma instancia de 
+um banco mongodb (mongod). Para ter resiliencia, é importante
+termos varios nodes, com redundancia de dados, oq garante segurança,
+e até performance, pois o client pode se referir a diferentes nodes
+
+sempre temos o node primario, e varios secundarios. 
+Naturalmente a escrita de dado chega no primario e os secundarios vão copiar depois.
+o writeConcern esta relacionado ao retorno do banco para o client (driver)
+de sucesso na escrita. Então o valor depois do 'w' é a quantidade de nodes no meu
+replicaset que precisam ter sucesso na escrita para retornar ao client q a escrita
+ocorreu. Se colocar um numero maior doq tem de nodes no replicaset, vai dar erro.
+
+O padrão do mongo é:
+writeConcern : {w:1}
+vai retornar sucesso quando escrever em 1 node
+
+para mais segurança posso colocar
+writeConcern : {w: majority }
+Pois só vai retornar sucesso quando a maioria dos nodes escreverem o dado
+Isso é uma boa para dados críticos parsa o sistema (como criar usuario), é mais lento
+
+para dados que escrevem muito, mas n são tão fundamentais posso usar
+writeConcern : {w: 0 }
+pois é possivel q retorne sucesso ao client mesmo sem escrever nada no banco
+mas pode identificar problemas de conexão no banco, e é mais rápido
+
+
+--- dicionario ---
+
+posso inserir um dicionario no valor de uma propriedade, e no banco vai inserir
+como um embedded document, cada Key como uma propriedade, e value como valor
+
+--- JOIN ---
+
+uso um agregation pra isso
+na minha model que vai receber os dados do join, eu preciso
+criar uma propriedade pra esses dados, mesmo que na collection equivalente
+do banco, essa prop não seja armazenada, e ela fique vazia em uma qry normal
+
+esse é exemplo de join entre 'Movies' e 'Comments'
+é interessante que no banco, 'Movies' não tem nada de comments,
+a prop na model é justamente pro join
+
+var movies = _moviesCollection
+                .Aggregate()
+                .Match(m => (int)m.Year < 1990 && (int)m.Year >= 1980)
+                .Lookup(
+                    _commentsCollection,
+                    m => m.Id,
+                    c => c.MovieId,
+                    (Movie m)=>m.Comments
+                    )
+                .ToList();
+				
+				
+Eu posso usar o compass pra construir uma pipeline, e colar lá no código
+mas ele vai usar a versão q mais se parece com a qry no mongo, usando
+os BsonDocument
+
+
+---- Read Concern ----
+
+devo pensar num replicaset com varios nodes
+
+um dado pode estar diferentes entre meus nodes,
+como um saldo desatualizado numa conta bancária
+
+então com readConcern "local", ele vai buscar oq está no 
+node primário, que será o mais atualizado, mas não verifica outros nodes
+então se esse primeiro cair, o dado pode estar em risco
+
+com readConcern "majority", ele vai buscar o dado que estiver
+replicado na maioria dos bancos, então ele pode estar desatualizado,
+mas vai ser mais seguro
+
+abaixo um agregate complicado
+
+var result = await _commentsCollection
+                   .WithReadConcern(ReadConcern.Local)
+                   .Aggregate()
+                   .Group(t => t.Email,
+                          x => new { id = x.Key, count = x.Sum(u => 1) })
+                   .Sort(new BsonDocument("count", -1))
+                   .Limit(20)
+                   .Project(group => new ReportProjection() { Id = group.id, Count = group.count })
+                   .ToListAsync();
+				   
+				   
+				
+---- bulk write ----
+
+posso escrever varios dados ao mesmo tempo
+eles podem ser ordenados ou não com a prop "ordered" true ou false
+se eles forem ordenados, então eles vao ser inseridis na ordem q eu escrever
+e se uma escrita der falha, as subsequentes nao vao acontecer
+se eles não forem ordenados, todas as escritas ocorrem simultaneamente,
+assim, uma falhando, não afeta as outras
+
+pra fazer um bulk write no C# preciso usar um WriteModel, por exemplo:
+
+
+var models = new List<ReplaceOneModel<Movie>>();
+
+// ratingPipelineResults é List<Movie>
+
+foreach(var item in ratingPipelineResults)
+{
+	models.Add(new ReplaceOneModel<Movie>(
+		Builders<Movie>.Filter.Where(x => x.Id == item.Id),
+		item));
+}
+
+_moviesCollection.BulkWriteAsync(models);	
+
+
+----- Connection Pooling ------
+
+ao rodar uma aplicação (client), o driver cria uma pool
+de 100 conexões com o banco, pois é mais performatico doq
+criar 1 conexão nova por acesso ao banco, as conexões
+já estão feitas
+
+100 conexões é uma quantidade suficiente para a maioria das
+aplicações medias
+
+posso alterar o tamanho do pool na connection string, por exemplo,
+limitando o numero para 50, colocando isso na connection string:
+
+"&maxPoolSize=50"
+
+- o '&' é o operador padrão de mais parâmetros nas URLs
+- "maxPoolSize=50" estou setando a prop pra 50
+
+
+---- Timeouts ----
+
+wtimeout (write timeout) - deve ser usado em escrita com "w : majority",
+ou qualquer uma q seja maior doq "w: 1"
+para não ficar tempo demais nisso
+
+{ w: "majority", wtimeout: 5000 } 
+o tempo está em milisegundos (5 segundos)
+
+serverSelectionTimeout
+- normalmente o driver espera 30 segundos antes de dar esse erro
+mas da pra mudar
+
+na connection string fica
+
+"&wtimeoutMS=2500"
+
+seta o wtimeout pra 2500 milisegundos
+
+
+---- Tratamento de erros ----
+
+é bom usar try-catch em situações q isso pode ocorrer:
+
+MongoWriteException:
+E11000 duplicate key error
+
+TimeoutException:
+A timeout ocurred after 30000ms			
+
+Usando o atlas, dificilmente vai ocorrer timeout com o banco
