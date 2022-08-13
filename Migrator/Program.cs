@@ -18,7 +18,7 @@ namespace Migrator
         static IMongoCollection<Movie> _moviesCollection;
 
         // TODO: Update this connection string as needed.
-        static string mongoConnectionString = "mongodb+srv://m220student:m220password@mflix.2d38szw.mongodb.net/?retryWrites=true&w=majority";
+        static string mongoConnectionString = "";
         
         static async Task Main(string[] args)
         {
